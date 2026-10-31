@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Root installer for Ubuntu + active Nginx or Caddy. Preserves unrelated routes."""
+"""Root installer for Ubuntu + active Nginx or Caddy. Preserves unrelated routes.
+
+On LON1 (Caddy since 30 Oct 2026) the lon1-caddy-kit already has an ipanswers.space block. If
+that block sends the site to 127.0.0.1:8764, it is accepted and left exactly as it is; only the
+app is deployed. A site block this script manages itself (BEGIN/END markers) is still updated.
+"""
 from __future__ import annotations
 import argparse
 import datetime as dt
@@ -13,7 +18,7 @@ import subprocess
 import sys
 import urllib.request
 from diagnose_server import diagnose
-from nginx_frontend import NginxFrontend
+from caddy_site import fetch_https, route_targets
 
 SOURCE = Path(__file__).resolve().parent
 BASE = Path('/opt/ipanswers')
@@ -102,10 +107,12 @@ def main():
         if not shutil.which(name):
             raise RuntimeError(f'Required command missing: {name}')
     nginx = None
+    keep_caddy = False
     nginx_state = subprocess.run(['systemctl','is-active','--quiet','nginx'],check=False)
     if nginx_state.returncode == 0:
         if not shutil.which('nginx'):
             raise RuntimeError('Nginx service is active but its executable is unavailable')
+        from nginx_frontend import NginxFrontend
         nginx = NginxFrontend()
         nginx.preflight()
     else:
@@ -136,7 +143,12 @@ def main():
                 for child in value:
                     yield from hosts(child)
         if BEGIN not in original and 'ipanswers.space' in set(hosts(json.loads(adapted))):
-            raise RuntimeError('ipanswers.space already has an unmanaged Caddy route. Nothing was changed.')
+            dials = route_targets('ipanswers.space', json.loads(adapted))['dial']
+            if not any(d in ('127.0.0.1:8764', 'localhost:8764', '[::1]:8764') for d in dials):
+                raise RuntimeError('ipanswers.space already has a Caddy route, but it goes to '
+                                   + (', '.join(dials) or 'no local app') + ', not 127.0.0.1:8764. Nothing was changed.')
+            keep_caddy = True
+            print('Caddy already sends ipanswers.space to 127.0.0.1:8764 (lon1-caddy-kit block); leaving the Caddyfile as it is.')
     prior_service = (UNITS/'ipanswers.service').exists()
     # Do not steal a port from another program.
     if not prior_service:
@@ -237,7 +249,7 @@ Persistent=true
 WantedBy=timers.target
 '''
     ranges = cloudflare_ranges()
-    config = None if nginx else replace_block(original, site_block(ranges))
+    config = None if (nginx or keep_caddy) else replace_block(original, site_block(ranges))
     changed = False
     try:
         changed = True
@@ -247,7 +259,7 @@ WantedBy=timers.target
         os.replace(link,BASE/'current')
         for name, content in zip(NAMES,(service,updater,timer)):
             atomic(UNITS/name,content)
-        if not nginx:
+        if config is not None:
             atomic(CADDY,config)
             run('caddy','validate','--config',str(CADDY),'--adapter','caddyfile')
         run('systemctl','daemon-reload')
@@ -265,8 +277,14 @@ WantedBy=timers.target
             raise RuntimeError('Application health check failed')
         if nginx:
             nginx.activate(ranges)
-        else:
+        elif config is not None:
             run('systemctl','reload','caddy')
+        if not nginx:
+            try:
+                status, _ = fetch_https('ipanswers.space', '/healthz')
+                print(f'Checked through Caddy: https://ipanswers.space/healthz answered {status}.')
+            except Exception as check_error:
+                print('WARNING: could not check the site through Caddy ('+str(check_error)+'); the app itself is healthy on 127.0.0.1:8764.', file=sys.stderr)
         print('\nInstalled successfully: https://ipanswers.space')
         print('Backup: '+str(backup))
         print('DNS must point ipanswers.space to lon1. Cloudflare SSL mode: Full (strict).')
@@ -278,7 +296,7 @@ WantedBy=timers.target
                     nginx.restore()
                 except Exception as restore_error:
                     print('Web rollback needs attention: '+str(restore_error),file=sys.stderr)
-            else:
+            elif config is not None:
                 shutil.copy2(backup/'Caddyfile',CADDY)
             subprocess.run(['systemctl','stop','ipanswers.service','ipanswers-update.timer'])
             if previous:
@@ -295,7 +313,7 @@ WantedBy=timers.target
             subprocess.run(['systemctl','daemon-reload'])
             if prior_service:
                 subprocess.run(['systemctl','restart','ipanswers.service','ipanswers-update.timer'])
-            if not nginx:
+            if config is not None:
                 subprocess.run(['systemctl','reload','caddy'])
         raise
 
